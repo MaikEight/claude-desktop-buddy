@@ -1,10 +1,10 @@
 #include "character.h"
-#include <M5StickCPlus.h>
+#include "lgfx_sc01plus.h"
 #include <LittleFS.h>
 #include <AnimatedGIF.h>
 #include <ArduinoJson.h>
 
-extern TFT_eSprite spr;
+extern LGFX_Sprite spr;
 
 static const char* STATE_NAMES[] = {
   "sleep", "idle", "busy", "attention", "celebrate", "dizzy", "heart"
@@ -44,7 +44,7 @@ static const int   PEEK_TOP = 70;
 static bool        peekMode = false;
 // Draw target — defaults to the sprite; characterRenderTo() retargets to
 // M5.Lcd for the landscape clock (both inherit TFT_eSPI).
-static TFT_eSPI*   _tgt = &spr;
+
 // Peek mode renders at half scale (2:1 nearest-neighbor in gifDrawCb) so
 // the whole pet fits the 70px window instead of cropping the top.
 static void gifPlace() {
@@ -111,7 +111,7 @@ static void gifDrawCb(GIFDRAW* d) {
   // disposal semantics are encoder-dependent and don't compose with the
   // 2:1 peek downscale's sample alignment.
   auto put = [&](int x, int y, uint8_t idx) {
-    _tgt->drawPixel(x, y, (hasT && idx == t) ? pal.bg : pal16[idx]);
+    spr.drawPixel(x, y, (hasT && idx == t) ? pal.bg : pal16[idx]);
   };
 
   if (peekMode) {
@@ -246,24 +246,6 @@ bool characterInit(const char* name) {
 
 bool characterLoaded() { return loaded; }
 const Palette& characterPalette() { return pal; }
-
-// One-shot half-scale render to an arbitrary surface (M5.Lcd for the
-// landscape clock). Caller owns clearing. Advances frame timing so
-// animation runs even when characterTick() is bypassed.
-void characterRenderTo(TFT_eSPI* tgt, int cx, int cy) {
-  if (!gifOpen) return;   // caller opens via characterSetState(activeState)
-  TFT_eSPI* prevT = _tgt; bool prevP = peekMode; int px = gifX, py = gifY;
-  _tgt = tgt; peekMode = true;
-  gifX = cx - gifW / 4;
-  gifY = cy - gifH / 4;
-  uint32_t now = millis();
-  if (now >= nextFrameAt) {
-    int delayMs = 0;
-    if (!gif.playFrame(false, &delayMs)) { gif.reset(); gif.playFrame(false, &delayMs); }
-    nextFrameAt = now + (delayMs > 0 ? delayMs : 100);
-  }
-  _tgt = prevT; peekMode = prevP; gifX = px; gifY = py;
-}
 
 void characterSetPeek(bool peek) {
   if (peekMode == peek) return;

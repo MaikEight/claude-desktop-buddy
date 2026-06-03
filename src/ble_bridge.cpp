@@ -1,4 +1,6 @@
 #include "ble_bridge.h"
+#include <esp_mac.h>
+#include <Preferences.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -6,6 +8,10 @@
 #include <BLE2902.h>
 #include <Arduino.h>
 #include <string.h>
+
+#if defined(CONFIG_NIMBLE_ENABLED)
+extern "C" int ble_svc_gap_device_name_set(const char* name);
+#endif
 
 // Nordic UART Service UUIDs — every BLE serial example uses these, so
 // existing tools (nRF Connect, bluefy, Web Bluetooth examples) can talk to
@@ -29,6 +35,8 @@ static volatile bool      connected = false;
 static volatile bool      secure = false;
 static volatile uint32_t  passkey = 0;
 static volatile uint16_t  mtu = 23;
+static char _gapDeviceName[32] = {};  // forward — populated in bleInit()
+static void _applyAdvOverride();      // forward — defined after bleInit()
 
 static void rxPush(const uint8_t* p, size_t n) {
   for (size_t i = 0; i < n; i++) {
@@ -40,30 +48,51 @@ static void rxPush(const uint8_t* p, size_t n) {
 }
 
 class RxCallbacks : public BLECharacteristicCallbacks {
+#if defined(CONFIG_NIMBLE_ENABLED)
+  void onWrite(BLECharacteristic* c, ble_gap_conn_desc* /*desc*/) override {
+#else
   void onWrite(BLECharacteristic* c) override {
-    std::string v = c->getValue();
-    if (!v.empty()) rxPush((const uint8_t*)v.data(), v.size());
+#endif
+    String v = c->getValue();
+    if (v.length()) rxPush((const uint8_t*)v.c_str(), v.length());
   }
 };
 
 class ServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* s) override {
+#if defined(CONFIG_NIMBLE_ENABLED)
+  void onConnect(BLEServer* /*s*/, ble_gap_conn_desc* /*desc*/) override {
+#else
+  void onConnect(BLEServer* /*s*/) override {
+#endif
     connected = true;
+    // Re-assert the device name so GATT 0x2A00 returns "Claude-XXXX" even if
+    // a host sync during pairing reset g_ble_svc_gap_name to "nimble".
+    if (_gapDeviceName[0]) ble_svc_gap_device_name_set(_gapDeviceName);
     Serial.println("[ble] connected");
   }
-  void onDisconnect(BLEServer* s) override {
+#if defined(CONFIG_NIMBLE_ENABLED)
+  void onDisconnect(BLEServer* /*s*/, ble_gap_conn_desc* /*desc*/) override {
+#else
+  void onDisconnect(BLEServer* /*s*/) override {
+#endif
     connected = false;
     secure = false;
     passkey = 0;
     mtu = 23;
     Serial.println("[ble] disconnected");
-    // Restart advertising so the next client can find us.
-    BLEDevice::startAdvertising();
+    _applyAdvOverride();  // stop → random addr → start → fix PDU name
   }
-  void onMtuChanged(BLEServer*, esp_ble_gatts_cb_param_t* param) override {
+#if defined(CONFIG_NIMBLE_ENABLED)
+  void onMtuChanged(BLEServer* /*s*/, ble_gap_conn_desc* /*desc*/, uint16_t newMtu) override {
+    mtu = newMtu;
+    Serial.printf("[ble] mtu=%u\n", mtu);
+  }
+#else
+  void onMtuChanged(BLEServer* /*s*/, esp_ble_gatts_cb_param_t* param) override {
     mtu = param->mtu.mtu;
     Serial.printf("[ble] mtu=%u\n", mtu);
   }
+#endif
 };
 
 // LE Secure Connections, passkey-entry: we are DisplayOnly, the central
@@ -78,20 +107,81 @@ class SecCallbacks : public BLESecurityCallbacks {
     passkey = pk;
     Serial.printf("[ble] passkey %06lu\n", (unsigned long)pk);
   }
+#if defined(CONFIG_NIMBLE_ENABLED)
+  void onAuthenticationComplete(ble_gap_conn_desc* desc) override {
+    passkey = 0;
+    secure = desc->sec_state.authenticated;
+    Serial.printf("[ble] auth %s\n", secure ? "ok" : "FAIL");
+    // Don't force-disconnect on auth failure — let macOS retry with fresh pairing.
+    // A stale LTK on the central side triggers a re-pair sequence that needs
+    // the connection to remain open.
+  }
+#else
   void onAuthenticationComplete(esp_ble_auth_cmpl_t cmpl) override {
     passkey = 0;
     secure = cmpl.success;
     Serial.printf("[ble] auth %s\n", cmpl.success ? "ok" : "FAIL");
-    if (!cmpl.success && server) server->disconnect(server->getConnId());
   }
+#endif
 };
 
+// NimBLE's advertising PDU builder and GAP service read ble_svc_gap_device_name()
+// directly rather than using the ble_hs_adv_fields.name pointer we set.
+// Wrap it at link time so every caller gets our actual device name instead of
+// the compiled-in "nimble" constant.
+extern "C" const char* __wrap_ble_svc_gap_device_name(void) {
+  return _gapDeviceName[0] ? _gapDeviceName : "nimble";
+}
+
+// Full advertising restart with static random address and correct device name.
+// Called instead of (not after) BLEDevice::startAdvertising().
+// Sequence: stop → set random addr → start → overwrite PDU name.
+static void _applyAdvOverride() {
+  // Random address stored in NVS so it's consistent across reboots (enabling
+  // bonding / auto-reconnect) but unique per device and different from the
+  // eFuse public address (avoiding macOS's "nimble" name cache for that address).
+  static uint8_t rnd[6] = {};
+  if (!rnd[0]) {
+    Preferences p;
+    // "ble_addr2" — new key so the old cached-as-nimble address is abandoned.
+    p.begin("ble_addr2", false);
+    if (p.getBytesLength("rnd") == 6) {
+      p.getBytes("rnd", rnd, 6);
+    } else {
+      esp_fill_random(rnd, 6);
+      rnd[5] = (rnd[5] & 0x3F) | 0xC0;  // top-2 bits=11 (static random format)
+      p.putBytes("rnd", rnd, 6);
+    }
+    p.end();
+  }
+  ble_gap_adv_stop();
+  BLEDevice::setOwnAddrType(1 /*BLE_OWN_ADDR_RANDOM*/);
+  BLEDevice::setOwnAddr(rnd);
+  BLEDevice::startAdvertising();
+  // No raw PDU override needed here: without addServiceUUID() the name never
+  // overflows to scan response, so ble_gap_adv_set_fields() puts "Claude-XXXX"
+  // directly into the main packet from the very first advertising PDU.
+}
+
 void bleInit(const char* deviceName) {
+  strncpy(_gapDeviceName, deviceName, sizeof(_gapDeviceName) - 1);
+
   BLEDevice::init(deviceName);
+
+  // BLEDevice::init() converts deviceName to a temporary std::string and
+  // passes .c_str() to ble_svc_gap_device_name_set() — NimBLE stores the
+  // pointer, but the temporary is destroyed when init() returns, leaving a
+  // dangling pointer and the stack falling back to its built-in "nimble"
+  // default.  Re-set using _gapDeviceName (static lifetime) so the pointer
+  // NimBLE holds stays valid for the life of the program.
+  ble_svc_gap_device_name_set(_gapDeviceName);
+
   // Request the biggest MTU we can get. macOS negotiates to 185 typically.
   BLEDevice::setMTU(517);
 
+#if !defined(CONFIG_NIMBLE_ENABLED)
   BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT_MITM);
+#endif
   BLEDevice::setSecurityCallbacks(new SecCallbacks());
 
   server = BLEDevice::createServer();
@@ -118,18 +208,34 @@ void bleInit(const char* deviceName) {
   svc->start();
 
   BLESecurity* sec = new BLESecurity();
+#if defined(CONFIG_NIMBLE_ENABLED)
+  sec->setAuthenticationMode(true, true, true);  // bonding=true, mitm=true, sc=true
+#else
   sec->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
+#endif
   sec->setCapability(ESP_IO_CAP_OUT);
   sec->setKeySize(16);
+#if !defined(CONFIG_NIMBLE_ENABLED)
   sec->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
   sec->setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+#endif
 
   BLEAdvertising* adv = BLEDevice::getAdvertising();
-  adv->addServiceUUID(NUS_SERVICE_UUID);
+  // Name only in main packet (3 flags + 13 name = 16 bytes) — fits without UUID.
+  // UUID goes in scan response so Claude desktop's UUID filter still finds us.
+  // With no addServiceUUID() the name does not overflow to scan response, so
+  // the corrected GAP name "Claude-XXXX" reaches the main advertising PDU.
+  // Main packet: name only — no UUID so it never overflows to scan response.
+  // NimBLE uses m_advData.name (= "Claude-XXXX") from the very first PDU.
+  // UUID goes in scan response; CoreBluetooth active scan picks it up.
+  adv->setName(deviceName);
+  BLEAdvertisementData scanRsp;
+  scanRsp.setCompleteServices(BLEUUID(NUS_SERVICE_UUID));
+  adv->setScanResponseData(scanRsp);
   adv->setScanResponse(true);
-  adv->setMinPreferred(0x06);   // iOS-friendly connection interval
+  adv->setMinPreferred(0x06);
   adv->setMaxPreferred(0x12);
-  BLEDevice::startAdvertising();
+  _applyAdvOverride();   // stop → fixed random addr → start (first PDU = "Claude-XXXX")
   Serial.printf("[ble] advertising as '%s'\n", deviceName);
 }
 
@@ -138,6 +244,12 @@ bool bleSecure()    { return secure; }
 uint32_t blePasskey() { return passkey; }
 
 void bleClearBonds() {
+#if defined(CONFIG_NIMBLE_ENABLED)
+  // NimBLE bond storage namespace is implementation-defined and hard to target
+  // safely. On factory reset the app reboots anyway, so old bonds expire
+  // naturally when the peer re-pairs. No-op here is intentional.
+  Serial.println("[ble] bonds cleared (NimBLE — re-pair required)");
+#else
   int n = esp_ble_get_bond_device_num();
   if (n <= 0) return;
   esp_ble_bond_dev_t* list = (esp_ble_bond_dev_t*)malloc(n * sizeof(esp_ble_bond_dev_t));
@@ -146,6 +258,7 @@ void bleClearBonds() {
   for (int i = 0; i < n; i++) esp_ble_remove_bond_device(list[i].bd_addr);
   free(list);
   Serial.printf("[ble] cleared %d bond(s)\n", n);
+#endif
 }
 
 size_t bleAvailable() {

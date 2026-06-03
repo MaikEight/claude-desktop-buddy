@@ -1,11 +1,14 @@
-#include <M5StickCPlus.h>
+#include "lgfx_sc01plus.h"
 #include <LittleFS.h>
 #include <stdarg.h>
+#include <sys/time.h>
+#include <esp_mac.h>
 #include "ble_bridge.h"
 #include "data.h"
 #include "buddy.h"
 
-TFT_eSprite spr = TFT_eSprite(&M5.Lcd);
+LGFX tft;
+LGFX_Sprite spr(&tft);
 
 // Advertise as "Claude-XXXX" (last two BT MAC bytes) so multiple sticks
 // in one room are distinguishable in the desktop picker. Name persists in
@@ -20,12 +23,13 @@ static void startBt() {
 
 #include "character.h"
 #include "stats.h"
-const int W = 135, H = 240;
+const int W = 320, H = 480;      // portrait 320×480 (rotation 0 on IC-native 320×480 panel)
 const int CX = W / 2;
-const int CY_BASE = 120;
-const int LED_PIN = 10;          // red LED, active-low
+const int CY_BASE = H / 2;
 
 // Colors used across multiple UI surfaces
+const uint16_t GREEN = 0x07E0;   // TFT green (was provided by M5StickCPlus.h)
+const uint16_t RED   = 0xF800;   // TFT red
 const uint16_t HOT   = 0xFA20;   // red-orange: warnings, impatience, deny
 const uint16_t PANEL = 0x2104;   // overlay panel background
 
@@ -87,19 +91,14 @@ bool     napping = false;
 uint32_t napStartMs = 0;
 uint32_t promptArrivedMs = 0;
 
-// Face-down = Z-axis dominant and negative. Debounced so a toss doesn't count.
-static bool isFaceDown() {
-  float ax, ay, az;
-  M5.Imu.getAccelData(&ax, &ay, &az);
-  return az < -0.7f && fabsf(ax) < 0.4f && fabsf(ay) < 0.4f;
-}
+// SC01 Plus has no IMU — nap and shake are disabled.
+static bool isFaceDown() { return false; }
 
-static void applyBrightness() { M5.Axp.ScreenBreath(20 + brightLevel * 20); }
+static void applyBrightness() { tft.setBrightness(50 + brightLevel * 40); }
 
 static void wake() {
   lastInteractMs = millis();
   if (screenOff) {
-    M5.Axp.SetLDO2(true);
     applyBrightness();
     screenOff = false;
     wakeTransitionUntil = millis() + 12000;
@@ -108,8 +107,8 @@ static void wake() {
 }
 bool     responseSent = false;
 
-static void beep(uint16_t freq, uint16_t dur) {
-  if (settings().sound) M5.Beep.tone(freq, dur);
+static void beep(uint16_t /*freq*/, uint16_t /*dur*/) {
+  // SC01 Plus has no built-in buzzer — sound disabled.
 }
 
 static void sendCmd(const char* json) {
@@ -305,7 +304,7 @@ static void drawReset() {
 void menuConfirm() {
   switch (menuSel) {
     case 0: settingsOpen = true; menuOpen = false; settingsSel = 0; break;
-    case 1: M5.Axp.PowerOff(); break;
+    case 1: esp_deep_sleep_start(); break;
     case 2:
     case 3:
       menuOpen = false;
@@ -337,68 +336,24 @@ void drawMenu() {
   drawMenuHints(p, mx, mw, my + mh - 12);
 }
 
-// Clock orientation: gravity along the in-plane X axis means the stick is
-// on its side. Signed counter for hysteresis on both transitions — same
-// pattern as face-down nap.
-//   0 = portrait (sprite path, pet sleeps underneath)
-//   1 = landscape, BtnA-side down (M5.Lcd rotation 1)
-//   3 = landscape, USB-side down (M5.Lcd rotation 3)
+// SC01 Plus always runs in portrait — no IMU, no landscape clock rotation.
 static uint8_t clockOrient   = 0;
 static int8_t  orientFrames  = 0;
 static uint8_t paintedOrient = 0;
-// RTC and IMU share an I2C bus. Reading the RTC at 60fps starves the IMU
-// reads in clockUpdateOrient — orientation detection gets noisy. Cache the
-// time once per second; mood logic and drawClock both read from here.
-static RTC_TimeTypeDef _clkTm;
-static RTC_DateTypeDef _clkDt;
-uint32_t               _clkLastRead = 0;   // zeroed by data.h on time-sync
-static bool            _onUsb       = false;
+// Time cache: refreshed once per second from the ESP32 system clock.
+// Time is set by the BLE bridge via settimeofday(); resets on power cycle.
+static struct tm _clkTm = {};
+uint32_t         _clkLastRead = 0;   // zeroed by data.h on time-sync
+static bool      _onUsb       = true;  // SC01 Plus is always USB-powered
 static void clockRefreshRtc() {
   if (millis() - _clkLastRead < 1000) return;
   _clkLastRead = millis();
-  _onUsb = M5.Axp.GetVBusVoltage() > 4.0f;
-  M5.Rtc.GetTime(&_clkTm);
-  M5.Rtc.GetDate(&_clkDt);
+  struct timeval tv; gettimeofday(&tv, nullptr);
+  localtime_r(&tv.tv_sec, &_clkTm);
 }
 
-static void clockUpdateOrient() {
-  float ax, ay, az;
-  M5.Imu.getAccelData(&ax, &ay, &az);
-  uint8_t lock = settings().clockRot;
-  if (lock == 1) { clockOrient = 0; return; }
-  if (lock == 2) {
-    // Locked landscape: never drop to 0, but still pick 1 vs 3 from
-    // gravity so the cradle works either way up. Need a strong tilt
-    // for the 1↔3 swap so handling jitter doesn't flip it; otherwise
-    // hold whatever we last had (or 1 from boot).
-    if (clockOrient == 0) clockOrient = (ax >= 0) ? 1 : 3;
-    if      (ax >  0.5f && clockOrient != 1) clockOrient = 1;
-    else if (ax < -0.5f && clockOrient != 3) clockOrient = 3;
-    return;
-  }
-  // Dual threshold: strict to enter (must be clearly sideways), loose to
-  // stay (tolerate ~65° of tilt). With one shared threshold a slight lean
-  // while sitting on the long edge puts ax right at the boundary and the
-  // counter ratchets down in ~half a second.
-  bool side = (clockOrient == 0)
-    ? fabsf(ax) > 0.7f && fabsf(ay) < 0.5f && fabsf(az) < 0.5f
-    : fabsf(ax) > 0.4f;
-  if (side) { if (orientFrames < 20) orientFrames++; }
-  else      { if (orientFrames > -10) orientFrames--; }
-  if (clockOrient == 0 && orientFrames >= 15) {
-    clockOrient = (ax > 0) ? 1 : 3;
-  } else if (clockOrient != 0 && orientFrames <= -8) {
-    clockOrient = 0;
-  } else if (clockOrient != 0 && side) {
-    // Direct 1↔3: a fast flip keeps |ax|>0.7 (just changes sign), so
-    // `side` never drops and the exit-via-0 path can't fire. Watch for
-    // ax sign disagreeing with the stored orientation.
-    static int8_t swapFrames = 0;
-    uint8_t want = (ax > 0) ? 1 : 3;
-    if (want != clockOrient) { if (++swapFrames >= 8) { clockOrient = want; swapFrames = 0; } }
-    else swapFrames = 0;
-  }
-}
+// No IMU — landscape clock orientation is permanently disabled.
+static void clockUpdateOrient() { clockOrient = 0; }
 
 // Clock face: shown when charging on USB with nothing else going on.
 // Portrait paints the upper ~110px to the sprite; pet renders below.
@@ -408,13 +363,13 @@ static const char* const MON[] = {
 };
 static const char* const DOW[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
 
-static uint8_t clockDow() { return _clkDt.WeekDay % 7; }
+static uint8_t clockDow() { return (uint8_t)_clkTm.tm_wday; }
 static void drawClock() {
   const Palette& p = characterPalette();
-  char hm[6]; snprintf(hm, sizeof(hm), "%02u:%02u", _clkTm.Hours, _clkTm.Minutes);
-  char ss[4]; snprintf(ss, sizeof(ss), ":%02u", _clkTm.Seconds);
-  uint8_t mi = (_clkDt.Month >= 1 && _clkDt.Month <= 12) ? _clkDt.Month - 1 : 0;
-  char dl[8]; snprintf(dl, sizeof(dl), "%s %02u", MON[mi], _clkDt.Date);
+  char hm[6]; snprintf(hm, sizeof(hm), "%02d:%02d", _clkTm.tm_hour, _clkTm.tm_min);
+  char ss[4]; snprintf(ss, sizeof(ss), ":%02d", _clkTm.tm_sec);
+  uint8_t mi = (uint8_t)(_clkTm.tm_mon % 12);
+  char dl[8]; snprintf(dl, sizeof(dl), "%s %02d", MON[mi], _clkTm.tm_mday);
 
   if (clockOrient == 0) {
     paintedOrient = 0;
@@ -429,51 +384,8 @@ static void drawClock() {
     return;
   }
 
-  // Landscape: 240×135 direct-to-LCD. Full fill only on entry; after that
-  // text glyph bg cells repaint themselves and the pet box (small, ~90×50)
-  // gets a fillRect each pet tick — small enough not to tear.
-  M5.Lcd.setRotation(clockOrient);
-  static uint8_t lastSec = 0xFF;
-  bool repaint = paintedOrient != clockOrient;
-  if (repaint) { M5.Lcd.fillScreen(p.bg); paintedOrient = clockOrient; lastSec = 0xFF; }
-
-  // Seconds tick at 1Hz; redrawing 3 strings at 60fps is 180 SPI ops/sec
-  // for nothing. Gate on the second changing (or full repaint).
-  if (repaint || _clkTm.Seconds != lastSec) {
-    lastSec = _clkTm.Seconds;
-    char wdl[12]; snprintf(wdl, sizeof(wdl), "%s %s %02u", DOW[clockDow()], MON[mi], _clkDt.Date);
-    char ssl[3]; snprintf(ssl, sizeof(ssl), "%02u", _clkTm.Seconds);
-    M5.Lcd.setTextDatum(MC_DATUM);
-    M5.Lcd.setTextSize(3); M5.Lcd.setTextColor(p.text, p.bg);    M5.Lcd.drawString(hm, 170, 42);
-    M5.Lcd.setTextSize(2); M5.Lcd.setTextColor(p.textDim, p.bg); M5.Lcd.drawString(ssl, 170, 72);
-                                                                  M5.Lcd.drawString(wdl, 170, 102);
-    M5.Lcd.setTextDatum(TL_DATUM);
-    M5.Lcd.setTextSize(1);
-  }
-
-  // Pet on left at 5 fps. Clear includes the overlay-particle zone above
-  // the body (y<30) — species draw Zzz/hearts there via BUDDY_Y_OVERLAY=6
-  // which doesn't go through _yb, so the box has to cover it.
-  static uint32_t lastPetTick = 0;
-  if (millis() - lastPetTick >= 200) {
-    lastPetTick = millis();
-    if (buddyMode) {
-      // ASCII glyphs don't self-clear; wipe the box each tick. Species
-      // hardcode BUDDY_X_CENTER=67 / BUDDY_Y_OVERLAY=6 for particles so
-      // keep portrait coords and just swap the surface — pet lands
-      // upper-left of landscape, which is where we want it anyway.
-      M5.Lcd.fillRect(0, 0, 115, 90, p.bg);
-      buddyRenderTo(&M5.Lcd, activeState);
-    } else {
-      // Full-frame GIFs paint every pixel (transparent → pal.bg), so a
-      // per-tick clear just adds a visible black flash between wipe and
-      // last scanline. The entry fillScreen on paintedOrient change
-      // already covers the surround.
-      characterSetState(activeState);
-      characterRenderTo(&M5.Lcd, 57, 45);
-    }
-  }
-  M5.Lcd.setRotation(0);
+  // Landscape orientation disabled on SC01 Plus (no IMU, always portrait).
+  // clockOrient is always 0, so this branch is never reached.
 }
 
 PersonaState derive(const TamaState& s) {
@@ -489,14 +401,7 @@ void triggerOneShot(PersonaState s, uint32_t durMs) {
   oneShotUntil = millis() + durMs;
 }
 
-bool checkShake() {
-  float ax, ay, az;
-  M5.Imu.getAccelData(&ax, &ay, &az);
-  float mag = sqrtf(ax*ax + ay*ay + az*az);
-  float delta = fabsf(mag - accelBaseline);
-  accelBaseline = accelBaseline * 0.95f + mag * 0.05f;
-  return delta > 0.8f;
-}
+bool checkShake() { return false; }  // no IMU on SC01 Plus
 
 
 
@@ -561,18 +466,17 @@ void drawInfo() {
     ln("> ascii pet to cycle.");
 
   } else if (infoPage == 1) {
-    _infoHeader(p, y, "BUTTONS", infoPage);
-    spr.setTextColor(p.text, p.bg);    ln("A   front");
+    _infoHeader(p, y, "TOUCH", infoPage);
+    spr.setTextColor(p.text, p.bg);    ln("Left half  [A]");
     spr.setTextColor(p.textDim, p.bg); ln("    next screen");
     ln("    approve prompt"); y += 4;
-    spr.setTextColor(p.text, p.bg);    ln("B   right side");
+    spr.setTextColor(p.text, p.bg);    ln("Right half [B]");
     spr.setTextColor(p.textDim, p.bg); ln("    next page");
     ln("    deny prompt"); y += 4;
-    spr.setTextColor(p.text, p.bg);    ln("hold A");
+    spr.setTextColor(p.text, p.bg);    ln("Hold left 0.6s");
     spr.setTextColor(p.textDim, p.bg); ln("    menu"); y += 4;
-    spr.setTextColor(p.text, p.bg);    ln("Power  left side");
-    spr.setTextColor(p.textDim, p.bg); ln("    tap = screen off");
-    ln("    hold 6s = off");
+    spr.setTextColor(p.text, p.bg);    ln("Tap when screen off");
+    spr.setTextColor(p.textDim, p.bg); ln("    wakes screen");
 
   } else if (infoPage == 2) {
     _infoHeader(p, y, "CLAUDE", infoPage);
@@ -593,29 +497,16 @@ void drawInfo() {
   } else if (infoPage == 3) {
     _infoHeader(p, y, "DEVICE", infoPage);
 
-    int vBat_mV = (int)(M5.Axp.GetBatVoltage() * 1000);
-    int iBat_mA = (int)M5.Axp.GetBatCurrent();
-    int vBus_mV = (int)(M5.Axp.GetVBusVoltage() * 1000);
-    int pct = (vBat_mV - 3200) / 10;   // (v-3.2)/(4.2-3.2)*100 = (v-3.2)*100 = (mv-3200)/10
-    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
-    bool usb = vBus_mV > 4000;
-    bool charging = usb && iBat_mA > 1;
-    bool full = usb && vBat_mV > 4100 && iBat_mA < 10;
-
+    // SC01 Plus is USB-powered only — no battery or AXP chip.
     spr.setTextColor(p.text, p.bg);
     spr.setTextSize(2);
     spr.setCursor(4, y);
-    spr.printf("%d%%", pct);
+    spr.print("USB");
     spr.setTextSize(1);
-    spr.setTextColor(full ? GREEN : (charging ? HOT : p.textDim), p.bg);
-    spr.setCursor(60, y + 4);
-    spr.print(full ? "full" : (charging ? "charging" : (usb ? "usb" : "battery")));
-    y += 20;
-
     spr.setTextColor(p.textDim, p.bg);
-    ln("  battery  %d.%02dV", vBat_mV/1000, (vBat_mV%1000)/10);
-    ln("  current  %+dmA", iBat_mA);
-    if (usb) ln("  usb in   %d.%02dV", vBus_mV/1000, (vBus_mV%1000)/10);
+    spr.setCursor(60, y + 4);
+    spr.print("USB-C powered");
+    y += 20;
     y += 8;
 
     spr.setTextColor(p.text, p.bg);
@@ -627,7 +518,7 @@ void drawInfo() {
     ln("  heap     %uKB", ESP.getFreeHeap() / 1024);
     ln("  bright   %u/4", brightLevel);
     ln("  bt       %s", settings().bt ? (dataBtActive() ? "linked" : "on") : "off");
-    ln("  temp     %dC", (int)M5.Axp.GetTempInAXP192());
+    ln("  temp     %dC", (int)temperatureRead());
 
   } else if (infoPage == 4) {
     _infoHeader(p, y, "BLUETOOTH", infoPage);
@@ -856,8 +747,7 @@ static void drawPetHowTo(const Palette& p) {
   ln(p.textDim, " level up + confetti"); gap();
 
   ln(p.body,    "ENERGY");
-  ln(p.textDim, " face-down to nap");
-  ln(p.textDim, " refills to full"); gap();
+  ln(p.textDim, " refills over time"); gap();
 
   ln(p.textDim, "idle 30s = off");
   ln(p.textDim, "any button = wake"); gap();
@@ -935,14 +825,35 @@ void drawHUD() {
   }
 }
 
+// Virtual touch buttons replacing the physical M5StickCPlus A/B buttons.
+// Left half of screen = A, right half = B. Long press (600ms) on A = menu.
+struct TouchBtn {
+  bool pressed = false, _prev = false;
+  uint32_t pressStart = 0;
+  void update(bool nowPressed) {
+    _prev = pressed; pressed = nowPressed;
+    if (pressed && !_prev) pressStart = millis();
+  }
+  bool wasPressed()  const { return  pressed && !_prev; }
+  bool wasReleased() const { return !pressed &&  _prev; }
+  bool isPressed()   const { return pressed; }
+  bool pressedFor(uint32_t ms) const { return pressed && (millis() - pressStart) >= ms; }
+};
+static TouchBtn btnA, btnB;
+
+static void updateTouch() {
+  lgfx::touch_point_t tp;
+  bool touched = tft.getTouch(&tp, 1);
+  btnA.update(touched && tp.x < W / 2);
+  btnB.update(touched && tp.x >= W / 2);
+}
+
 void setup() {
-  M5.begin();
-  M5.Lcd.setRotation(0);
-  M5.Imu.Init();
-  M5.Beep.begin();
+  Serial.begin(115200);
+  delay(500);
+  tft.init();
+  tft.setRotation(2);   // portrait 180°: IC-native 320×480, USB-C at bottom
   startBt();
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH);   // off
   applyBrightness();
   lastInteractMs = millis();
   statsLoad();
@@ -951,6 +862,8 @@ void setup() {
   buddyInit();
 
   // BLE stays always-on; s.bt is stored as a preference only.
+  spr.setColorDepth(16);
+  spr.setPsram(true);   // SC01 Plus has 2MB PSRAM; sprite (480×320×2=307KB) must live there
   spr.createSprite(W, H);
   characterInit(nullptr);  // scan /characters/ for whatever is installed
   gifAvailable = characterLoaded();
@@ -986,8 +899,7 @@ void setup() {
 }
 
 void loop() {
-  M5.update();
-  M5.Beep.update();
+  updateTouch();
   t++;
   uint32_t now = millis();
 
@@ -1001,14 +913,7 @@ void loop() {
 
   if ((int32_t)(now - oneShotUntil) >= 0) activeState = baseState;
 
-  // LED: pulse on attention, otherwise off
-  if (activeState == P_ATTENTION && settings().led) {
-    digitalWrite(LED_PIN, (now / 400) % 2 ? LOW : HIGH);
-  } else {
-    digitalWrite(LED_PIN, HIGH);
-  }
-
-  // shake → dizzy + force scenario advance
+  // shake → dizzy + force scenario advance (always skipped — no IMU)
   if (now - lastShakeCheck > 50) {
     lastShakeCheck = now;
     if (!menuOpen && !screenOff && checkShake() && (int32_t)(now - oneShotUntil) >= 0) {
@@ -1040,29 +945,32 @@ void loop() {
 
   bool inPrompt = tama.promptId[0] && !responseSent;
 
-  // Button-press wake. Track which button woke the screen so its full
-  // press cycle (including long-press) is swallowed — you don't want
-  // BtnA-to-wake to also cycle displayMode or open the menu.
-  if (M5.BtnA.isPressed() || M5.BtnB.isPressed()) {
+  // Touch-press wake. Track which zone woke the screen so the full
+  // press cycle (including long-press) is swallowed after wake.
+  if (btnA.isPressed() || btnB.isPressed()) {
     if (screenOff) {
-      if (M5.BtnA.isPressed()) swallowBtnA = true;
-      if (M5.BtnB.isPressed()) swallowBtnB = true;
+      if (btnA.isPressed()) swallowBtnA = true;
+      if (btnB.isPressed()) swallowBtnB = true;
     }
     wake();
   }
 
-  // AXP power button (left side): short-press toggles screen off.
-  // Long-press (6s) still powers off the device via AXP hardware.
-  if (M5.Axp.GetBtnPress() == 0x02) {
+  // Screen-off toggle: both zones touched simultaneously → toggle display.
+  // On SC01 Plus there's no physical power button; this replicates the
+  // M5StickCPlus AXP short-press behaviour.
+  static bool prevBothTouch = false;
+  bool bothTouch = btnA.isPressed() && btnB.isPressed();
+  if (bothTouch && !prevBothTouch) {
     if (screenOff) {
       wake();
     } else {
-      M5.Axp.SetLDO2(false);
+      tft.setBrightness(0);
       screenOff = true;
     }
   }
+  prevBothTouch = bothTouch;
 
-  if (M5.BtnA.pressedFor(600) && !btnALong && !swallowBtnA) {
+  if (btnA.pressedFor(600) && !btnALong && !swallowBtnA) {
     btnALong = true;
     beep(800, 60);
     if (resetOpen) { resetOpen = false; }
@@ -1074,7 +982,7 @@ void loop() {
     }
     Serial.println(menuOpen ? "menu open" : "menu close");
   }
-  if (M5.BtnA.wasReleased()) {
+  if (btnA.wasReleased()) {
     if (!btnALong && !swallowBtnA) {
       if (inPrompt) {
         char cmd[96];
@@ -1105,8 +1013,8 @@ void loop() {
     swallowBtnA = false;
   }
 
-  // BtnB: pet → heart
-  if (M5.BtnB.wasPressed()) {
+  // BtnB (right touch zone): deny/scroll/page
+  if (btnB.wasPressed()) {
     if (swallowBtnB) { swallowBtnB = false; }
     else
     if (inPrompt) {
@@ -1170,7 +1078,7 @@ void loop() {
     bool weekend = (dow == 0 || dow == 6);
     bool friday  = (dow == 5);
 
-    uint8_t h = _clkTm.Hours;
+    uint8_t h = (uint8_t)_clkTm.tm_hour;
     if (h >= 1 && h < 7)             activeState = P_SLEEP;
     else if (weekend)                activeState = (now/8000 % 6 == 0) ? P_HEART : P_SLEEP;
     else if (h < 9)                  activeState = (now/6000 % 4 == 0) ? P_IDLE  : P_SLEEP;
@@ -1243,7 +1151,7 @@ void loop() {
   if (!napping && faceDownFrames >= 15) {
     napping = true;
     napStartMs = now;
-    M5.Axp.ScreenBreath(8);
+    tft.setBrightness(8);
     dimmed = true;
   } else if (napping && faceDownFrames <= -8) {
     napping = false;
@@ -1257,7 +1165,7 @@ void loop() {
   // No auto-off on USB power — clock face wants to stay visible while charging.
   if (!screenOff && !inPrompt && !_onUsb
       && millis() - lastInteractMs > SCREEN_OFF_MS) {
-    M5.Axp.SetLDO2(false);
+    tft.setBrightness(0);
     screenOff = true;
   }
 
