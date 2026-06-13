@@ -67,6 +67,25 @@ inline const char* dataScenarioName() {
 static bool _rtcValid = false;
 inline bool dataRtcValid() { return _rtcValid; }
 
+// The desktop bridge emits a "(no message)" / "(no messages)" placeholder
+// when there's nothing to show. Treat any string containing it (case-
+// insensitive) as empty so the display stays blank instead of printing it.
+static bool _isNoMsg(const char* s) {
+  if (!s) return false;
+  for (const char* p = s; *p; ++p) {
+    const char* a = p;
+    const char* b = "(no message";
+    while (*b) {
+      char c = *a;
+      if (c >= 'A' && c <= 'Z') c += 32;
+      if (c != *b) break;
+      ++a; ++b;
+    }
+    if (!*b) return true;
+  }
+  return false;
+}
+
 static void _applyJson(const char* line, TamaState* out) {
   JsonDocument doc;
   if (deserializeJson(doc, line)) return;
@@ -95,6 +114,7 @@ static void _applyJson(const char* line, TamaState* out) {
   if (doc["tokens"].is<uint32_t>()) statsOnBridgeTokens(bridgeTokens);
   out->tokensToday = doc["tokens_today"] | out->tokensToday;
   const char* m = doc["msg"];
+  if (_isNoMsg(m)) m = "";
   if (m) { strncpy(out->msg, m, sizeof(out->msg)-1); out->msg[sizeof(out->msg)-1]=0; }
   JsonArray la = doc["entries"];
   if (!la.isNull()) {
@@ -102,6 +122,7 @@ static void _applyJson(const char* line, TamaState* out) {
     for (JsonVariant v : la) {
       if (n >= 8) break;
       const char* s = v.as<const char*>();
+      if (_isNoMsg(s)) continue;   // skip placeholder entries
       strncpy(out->lines[n], s ? s : "", 91); out->lines[n][91]=0;
       n++;
     }

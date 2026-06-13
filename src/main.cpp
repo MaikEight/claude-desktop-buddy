@@ -106,6 +106,7 @@ static void wake() {
   if (dimmed) { applyBrightness(); dimmed = false; }
 }
 bool     responseSent = false;
+uint32_t responseSentMs = 0;     // when we approved/denied — used to auto-dismiss the panel
 
 static void beep(uint16_t /*freq*/, uint16_t /*dur*/) {
   // SC01 Plus has no built-in buzzer — sound disabled.
@@ -581,7 +582,7 @@ void drawInfo() {
 
 // Greedy word-wrap into fixed-width rows. Continuation rows get a leading
 // space. Returns number of rows written.
-static uint8_t wrapInto(const char* in, char out[][24], uint8_t maxRows, uint8_t width) {
+static uint8_t wrapInto(const char* in, char out[][32], uint8_t maxRows, uint8_t width) {
   uint8_t row = 0, col = 0;
   const char* p = in;
   while (*p && row < maxRows) {
@@ -615,47 +616,53 @@ static uint8_t wrapInto(const char* in, char out[][24], uint8_t maxRows, uint8_t
 
 static void drawApproval() {
   const Palette& p = characterPalette();
-  const int AREA = 78;
-  spr.fillRect(0, H - AREA, W, AREA, p.bg);
-  spr.drawFastHLine(0, H - AREA, W, p.textDim);
+  const int AREA = 112;
+  const int TOP  = H - AREA;
+  const int CW   = 11;   // FreeMono9pt7b advance width
+  spr.fillRect(0, TOP, W, AREA, p.bg);
+  spr.drawFastHLine(0, TOP, W, p.textDim);
 
-  spr.setTextSize(1);
-  spr.setTextColor(p.textDim, p.bg);
-  spr.setCursor(4, H - AREA + 4);
+  // Timer line: small/dim, turns hot after 10s. Kept in the compact GLCD font.
   uint32_t waited = (millis() - promptArrivedMs) / 1000;
-  if (waited >= 10) spr.setTextColor(HOT, p.bg);
+  spr.setFont(&fonts::Font0);
+  spr.setTextSize(1);
+  spr.setTextColor(waited >= 10 ? HOT : p.textDim, p.bg);
+  spr.setCursor(4, TOP + 4);
   spr.printf("approve? %lus", (unsigned long)waited);
 
-  // Size 2 only if it fits one line (~10 chars at 12px on 135px screen)
-  int toolLen = strlen(tama.promptTool);
-  spr.setTextColor(p.text, p.bg);
-  spr.setTextSize(toolLen <= 10 ? 2 : 1);
-  spr.setCursor(4, H - AREA + (toolLen <= 10 ? 14 : 18));
-  spr.print(tama.promptTool);
+  // Tool + command in FreeMono9pt7b — readable (~11px) and full width, without
+  // the size-2 font being oversized. wrapInto keeps the path on the screen.
+  spr.setFont(&fonts::FreeMono9pt7b);
   spr.setTextSize(1);
 
-  // Hint wraps at ~21 chars to two lines under the tool name
-  spr.setTextColor(p.textDim, p.bg);
-  int hlen = strlen(tama.promptHint);
-  spr.setCursor(4, H - AREA + 34);
-  spr.printf("%.21s", tama.promptHint);
-  if (hlen > 21) {
-    spr.setCursor(4, H - AREA + 42);
-    spr.printf("%.21s", tama.promptHint + 21);
+  spr.setTextColor(p.body, p.bg);
+  spr.setCursor(4, TOP + 14);
+  spr.print(tama.promptTool);
+
+  char hl[3][32];
+  uint8_t nh = wrapInto(tama.promptHint, hl, 3, 28);
+  spr.setTextColor(p.text, p.bg);
+  for (uint8_t i = 0; i < nh; i++) {
+    spr.setCursor(4, TOP + 34 + i * 18);
+    spr.print(hl[i]);
   }
 
+  // Action row — anchored to the bottom.
   if (responseSent) {
     spr.setTextColor(p.textDim, p.bg);
-    spr.setCursor(4, H - 12);
+    spr.setCursor(4, H - 20);
     spr.print("sent...");
   } else {
     spr.setTextColor(GREEN, p.bg);
-    spr.setCursor(4, H - 12);
+    spr.setCursor(4, H - 20);
     spr.print("A: approve");
     spr.setTextColor(HOT, p.bg);
-    spr.setCursor(W - 48, H - 12);
+    spr.setCursor(W - 7 * CW - 4, H - 20);   // "B: deny" = 7 chars, right-aligned
     spr.print("B: deny");
   }
+
+  spr.setFont(&fonts::Font0);   // restore the default GLCD font for other UI
+  spr.setTextSize(1);
 }
 
 static void tinyHeart(int x, int y, bool filled, uint16_t col) {
@@ -778,25 +785,35 @@ void drawPet() {
 }
 
 void drawHUD() {
-  if (tama.promptId[0]) { drawApproval(); return; }
+  // Show the approval panel while a prompt is pending. Once we've responded,
+  // keep it up only briefly to flash "sent...", then fall through to the
+  // normal HUD — don't wait for the bridge to clear promptId (its keepalive
+  // can carry the stale prompt, leaving the panel stuck for seconds).
+  if (tama.promptId[0] && (!responseSent || millis() - responseSentMs < 800)) {
+    drawApproval();
+    return;
+  }
   const Palette& p = characterPalette();
-  const int SHOW = 3, LH = 8, WIDTH = 21;
-  const int AREA = SHOW * LH + 4;
+  const int SHOW = 3, LH = 18, WIDTH = 28;   // FreeMono9pt7b (~11px) wrapped across the full 320px width
+  const int AREA = SHOW * LH + 2;
   spr.fillRect(0, H - AREA, W, AREA, p.bg);
+  spr.setFont(&fonts::FreeMono9pt7b);
   spr.setTextSize(1);
 
   if (tama.lineGen != lastLineGen) { msgScroll = 0; lastLineGen = tama.lineGen; wake(); }
 
   if (tama.nLines == 0) {
     spr.setTextColor(p.text, p.bg);
-    spr.setCursor(4, H - LH - 2);
+    spr.setCursor(4, H - LH - 1);
     spr.print(tama.msg);
+    spr.setFont(&fonts::Font0);
+    spr.setTextSize(1);
     return;
   }
 
   // Wrap all transcript lines into a flat display buffer. Track which
   // transcript index each display row came from, so we can dim older ones.
-  static char disp[32][24];
+  static char disp[32][32];
   static uint8_t srcOf[32];
   uint8_t nDisp = 0;
   for (uint8_t i = 0; i < tama.nLines && nDisp < 32; i++) {
@@ -815,13 +832,22 @@ void drawHUD() {
     uint8_t row = start + i;
     bool fresh = (srcOf[row] == newest) && (msgScroll == 0);
     spr.setTextColor(fresh ? p.text : p.textDim, p.bg);
-    spr.setCursor(4, H - AREA + 2 + i * LH);
+    spr.setCursor(4, H - AREA + 1 + i * LH);
     spr.print(disp[row]);
   }
+
+  spr.setFont(&fonts::Font0);   // restore the default GLCD font for other UI
+  spr.setTextSize(1);
   if (msgScroll > 0) {
+    // Small scroll-back badge in the compact GLCD font, with its own bg fill
+    // so it stays legible over the full-width text it overlaps.
+    char sb[8];
+    snprintf(sb, sizeof(sb), "-%u", msgScroll);
+    int sw = (int)strlen(sb) * 6 + 4;
+    spr.fillRect(W - sw, H - 10, sw, 10, p.bg);
     spr.setTextColor(p.body, p.bg);
-    spr.setCursor(W - 18, H - LH - 2);
-    spr.printf("-%u", msgScroll);
+    spr.setCursor(W - sw + 2, H - 9);
+    spr.print(sb);
   }
 }
 
@@ -989,6 +1015,7 @@ void loop() {
         snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"once\"}", tama.promptId);
         sendCmd(cmd);
         responseSent = true;
+        responseSentMs = millis();
         uint32_t tookS = (millis() - promptArrivedMs) / 1000;
         statsOnApproval(tookS);
         beep(2400, 60);
@@ -1022,6 +1049,7 @@ void loop() {
       snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"deny\"}", tama.promptId);
       sendCmd(cmd);
       responseSent = true;
+      responseSentMs = millis();
       statsOnDenial();
       beep(600, 60);
     } else if (resetOpen) {
