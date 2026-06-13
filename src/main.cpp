@@ -784,13 +784,70 @@ void drawPet() {
   spr.printf("%u/%u", petPage + 1, PET_PAGES);
 }
 
+// AskUserQuestion: read-only. The options (parsed from the turn event) and the
+// custom field are shown so you can see what's being asked at a glance, but the
+// protocol has no way to submit a choice — you answer in the desktop app. Uses
+// a tall panel below the character since it's content-rich.
+static void drawQuestion() {
+  const Palette& p = characterPalette();
+  const int TOP = 168;                 // clears the character/buddy zone above
+  spr.fillRect(0, TOP, W, H - TOP, p.bg);
+  spr.drawFastHLine(0, TOP, W, p.textDim);
+
+  // Title row (compact GLCD font): "QUESTION" + optional header.
+  spr.setFont(&fonts::Font0);
+  spr.setTextSize(1);
+  spr.setTextColor(p.body, p.bg);
+  spr.setCursor(4, TOP + 5);
+  if (tama.qHeader[0]) spr.printf("QUESTION  %.20s", tama.qHeader);
+  else                 spr.print("QUESTION");
+
+  spr.setFont(&fonts::FreeMono9pt7b);
+  spr.setTextSize(1);
+  int y = TOP + 20;
+
+  // Question text — wrapped, up to 4 lines (falls back if the turn event with
+  // the options never arrived, e.g. it exceeded the desktop's 4KB cap).
+  const char* qt = tama.qText[0] ? tama.qText : "Claude is asking a question.";
+  char ql[7][32];
+  uint8_t nq = wrapInto(qt, ql, 7, 28);
+  spr.setTextColor(p.text, p.bg);
+  for (uint8_t i = 0; i < nq; i++) { spr.setCursor(4, y); spr.print(ql[i]); y += 16; }
+  y += 8;
+
+  // Options — read-only, numbered 1., 2., …
+  for (uint8_t i = 0; i < tama.qNOpts; i++) {
+    char row[44];
+    snprintf(row, sizeof(row), "%u. %.24s", (unsigned)(i + 1), tama.qOpts[i]);
+    spr.setTextColor(p.text, p.bg);
+    spr.setCursor(6, y); spr.print(row);
+    y += 18;
+  }
+
+  // Custom / "Other" field — present but not usable here, numbered next.
+  spr.setTextColor(p.textDim, p.bg);
+  spr.setCursor(6, y);
+  spr.printf("%u. Other (desktop)", (unsigned)(tama.qNOpts + 1));
+
+  // Footer — where to actually answer.
+  spr.setFont(&fonts::Font0);
+  spr.setTextSize(1);
+  spr.setTextColor(p.body, p.bg);
+  spr.setCursor(4, H - 12);
+  spr.print("answer in the desktop app");
+
+  spr.setFont(&fonts::Font0);   // restore default GLCD font for other UI
+  spr.setTextSize(1);
+}
+
 void drawHUD() {
-  // Show the approval panel while a prompt is pending. Once we've responded,
-  // keep it up only briefly to flash "sent...", then fall through to the
-  // normal HUD — don't wait for the bridge to clear promptId (its keepalive
+  // Show the approval/question panel while a prompt is pending. Once we've
+  // responded, keep it up only briefly to flash "sent...", then fall through to
+  // the normal HUD — don't wait for the bridge to clear promptId (its keepalive
   // can carry the stale prompt, leaving the panel stuck for seconds).
   if (tama.promptId[0] && (!responseSent || millis() - responseSentMs < 800)) {
-    drawApproval();
+    if (strcmp(tama.promptTool, "AskUserQuestion") == 0) drawQuestion();
+    else drawApproval();
     return;
   }
   const Palette& p = characterPalette();
@@ -1010,7 +1067,9 @@ void loop() {
   }
   if (btnA.wasReleased()) {
     if (!btnALong && !swallowBtnA) {
-      if (inPrompt) {
+      if (inPrompt && strcmp(tama.promptTool, "AskUserQuestion") == 0) {
+        // Read-only question — the device can't submit a choice. Ignore taps.
+      } else if (inPrompt) {
         char cmd[96];
         snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"once\"}", tama.promptId);
         sendCmd(cmd);
@@ -1044,7 +1103,9 @@ void loop() {
   if (btnB.wasPressed()) {
     if (swallowBtnB) { swallowBtnB = false; }
     else
-    if (inPrompt) {
+    if (inPrompt && strcmp(tama.promptTool, "AskUserQuestion") == 0) {
+      // Read-only question — answered on the desktop. Ignore taps.
+    } else if (inPrompt) {
       char cmd[96];
       snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"deny\"}", tama.promptId);
       sendCmd(cmd);

@@ -19,6 +19,14 @@ struct TamaState {
   char     promptId[40];     // pending permission request ID; empty = no prompt
   char     promptTool[20];
   char     promptHint[44];
+  // Latest AskUserQuestion (parsed from turn events) — shown read-only when an
+  // "approve: AskUserQuestion" prompt is active. The device can't submit a
+  // choice (protocol has no answer command); the user answers on the desktop.
+  char     qHeader[24];
+  char     qText[200];
+  char     qOpts[4][44];
+  uint8_t  qNOpts;
+  bool     qMulti;
 };
 
 // ---------------------------------------------------------------------------
@@ -86,7 +94,90 @@ static bool _isNoMsg(const char* s) {
   return false;
 }
 
+static void _sanitize(char* dst, const char* src, size_t cap);   // defined below
+
+// Pull questions[0] (text, header, option labels) from an AskUserQuestion
+// tool_use block in a turn event. Stored for read-only display.
+static void _parseQuestion(JsonObject blk, TamaState* out) {
+  JsonObject q0 = blk["input"]["questions"][0];
+  if (q0.isNull()) return;
+  const char* qt = q0["question"];
+  const char* qh = q0["header"];
+  _sanitize(out->qText,   qt ? qt : "", sizeof(out->qText));
+  _sanitize(out->qHeader, qh ? qh : "", sizeof(out->qHeader));
+  out->qMulti = q0["multiSelect"] | false;
+  uint8_t n = 0;
+  for (JsonObject op : q0["options"].as<JsonArray>()) {
+    if (n >= 4) break;
+    const char* lb = op["label"];
+    _sanitize(out->qOpts[n], lb ? lb : "", sizeof(out->qOpts[n]));
+    n++;
+  }
+  out->qNOpts = n;
+}
+
+// FreeMono9pt7b (and the GLCD font) only cover ASCII 0x20-0x7E. Desktop text
+// often contains UTF-8 typographic punctuation (em dash, curly quotes, ellipsis)
+// that would otherwise render as "tofu" boxes. Map the common ones to ASCII and
+// drop anything else non-printable. Copies up to cap-1 chars + null.
+static void _sanitize(char* dst, const char* src, size_t cap) {
+  size_t o = 0;
+  for (size_t i = 0; src[i] && o < cap - 1; ) {
+    unsigned char c = (unsigned char)src[i];
+    if (c < 0x80) {                                  // plain ASCII
+      dst[o++] = (c >= 0x20 && c < 0x7F) ? (char)c : ' ';
+      i++;
+      continue;
+    }
+    uint32_t cp = 0; int len;                        // decode UTF-8 sequence
+    if      ((c & 0xE0) == 0xC0) { cp = c & 0x1F; len = 2; }
+    else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; len = 3; }
+    else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; len = 4; }
+    else { i++; continue; }                          // stray byte → skip
+    for (int k = 1; k < len; k++) {
+      unsigned char cc = (unsigned char)src[i + k];
+      if ((cc & 0xC0) != 0x80) { len = k; break; }   // truncated sequence
+      cp = (cp << 6) | (cc & 0x3F);
+    }
+    i += len;
+    const char* rep;
+    switch (cp) {
+      case 0x2012: case 0x2013: case 0x2014: case 0x2015: rep = "-";   break; // dashes
+      case 0x2018: case 0x2019: case 0x201B: case 0x2032: rep = "'";   break; // single quotes
+      case 0x201C: case 0x201D: case 0x201F: case 0x2033: rep = "\"";  break; // double quotes
+      case 0x2026: rep = "..."; break;                                        // ellipsis
+      case 0x2022: case 0x00B7: case 0x2219: rep = "*";  break;               // bullet / middot
+      case 0x2192: rep = "->"; break;                                         // right arrow
+      case 0x00A0: rep = " ";  break;                                         // nbsp
+      default:     rep = "?";  break;                                         // unknown glyph
+    }
+    for (const char* r = rep; *r && o < cap - 1; r++) dst[o++] = *r;
+  }
+  dst[o] = 0;
+}
+
 static void _applyJson(const char* line, TamaState* out) {
+  // Turn events mirror every session's content. We only care about an
+  // AskUserQuestion tool call; skip the rest cheaply and — importantly —
+  // never let a turn event clear the active permission prompt below.
+  if (strstr(line, "\"evt\":\"turn\"")) {
+    _lastLiveMs = millis();
+    if (!strstr(line, "AskUserQuestion")) return;
+    JsonDocument tdoc;
+    if (deserializeJson(tdoc, line)) return;
+    JsonArray content = tdoc["content"];
+    if (content.isNull()) return;
+    for (JsonObject blk : content) {
+      const char* bt = blk["type"];
+      const char* bn = blk["name"];
+      if (bt && bn && strcmp(bt, "tool_use") == 0 && strcmp(bn, "AskUserQuestion") == 0) {
+        _parseQuestion(blk, out);
+        break;
+      }
+    }
+    return;
+  }
+
   JsonDocument doc;
   if (deserializeJson(doc, line)) return;
   if (xferCommand(doc)) { _lastLiveMs = millis(); return; }
@@ -115,7 +206,7 @@ static void _applyJson(const char* line, TamaState* out) {
   out->tokensToday = doc["tokens_today"] | out->tokensToday;
   const char* m = doc["msg"];
   if (_isNoMsg(m)) m = "";
-  if (m) { strncpy(out->msg, m, sizeof(out->msg)-1); out->msg[sizeof(out->msg)-1]=0; }
+  if (m) _sanitize(out->msg, m, sizeof(out->msg));
   JsonArray la = doc["entries"];
   if (!la.isNull()) {
     uint8_t n = 0;
@@ -123,7 +214,7 @@ static void _applyJson(const char* line, TamaState* out) {
       if (n >= 8) break;
       const char* s = v.as<const char*>();
       if (_isNoMsg(s)) continue;   // skip placeholder entries
-      strncpy(out->lines[n], s ? s : "", 91); out->lines[n][91]=0;
+      _sanitize(out->lines[n], s ? s : "", sizeof(out->lines[n]));
       n++;
     }
     if (n != out->nLines || (n > 0 && strcmp(out->lines[n-1], out->msg) != 0)) {
@@ -135,8 +226,8 @@ static void _applyJson(const char* line, TamaState* out) {
   if (!pr.isNull()) {
     const char* pid = pr["id"]; const char* pt = pr["tool"]; const char* ph = pr["hint"];
     strncpy(out->promptId,   pid ? pid : "", sizeof(out->promptId)-1);   out->promptId[sizeof(out->promptId)-1]=0;
-    strncpy(out->promptTool, pt  ? pt  : "", sizeof(out->promptTool)-1); out->promptTool[sizeof(out->promptTool)-1]=0;
-    strncpy(out->promptHint, ph  ? ph  : "", sizeof(out->promptHint)-1); out->promptHint[sizeof(out->promptHint)-1]=0;
+    _sanitize(out->promptTool, pt ? pt : "", sizeof(out->promptTool));
+    _sanitize(out->promptHint, ph ? ph : "", sizeof(out->promptHint));
   } else {
     out->promptId[0] = 0; out->promptTool[0] = 0; out->promptHint[0] = 0;
   }
@@ -160,7 +251,10 @@ struct _LineBuf {
   }
 };
 
-static _LineBuf<1024> _usbLine, _btLine;
+// 4608 bytes: turn events carry the full SDK content array (capped at 4KB by
+// the desktop). The old 1024 buffer truncated them, so AskUserQuestion options
+// never parsed. BLE is the real transport; USB mirrors the size for parity.
+static _LineBuf<4608> _usbLine, _btLine;
 
 inline void dataPoll(TamaState* out) {
   uint32_t now = millis();
